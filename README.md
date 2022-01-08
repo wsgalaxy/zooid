@@ -1,1 +1,1 @@
-Empty crate, used only to reserve the name.
+An actor library inspired by actix

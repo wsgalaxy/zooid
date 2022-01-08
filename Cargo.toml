@@ -1,9 +1,9 @@
 [package]
 name = "zooid"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2018"
 license = "MIT OR Apache-2.0"
-description = "Empty crate, used only to reserve the name."
+description = "An actor library inspired by actix"
 homepage = "https://github.com/wsgalaxy/zooid"
 repository = "https://github.com/wsgalaxy/zooid"
 readme = "README.md"

@@ -10,5 +10,11 @@ readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[example]]
+name = "pingpong"
+
+[[example]]
+name = "benchmark"
+
 [dependencies]
 tokio = { version = "1.15.0", features = ["full"] }

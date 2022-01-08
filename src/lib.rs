@@ -19,10 +19,11 @@ where
 {
     fn into_msg<M>(self) -> Option<M>
     where
+        A: Handler<M>,
         M: Message,
     {
         if let ContextMsg::Msg(mut m) = self {
-            if let Some(env) = m.as_any_mut().downcast_mut::<Envelope<M>>() {
+            if let Some(env) = m.as_any_mut().downcast_mut::<Envelope<A, M>>() {
                 env.msg.take()
             } else {
                 None
@@ -60,8 +61,21 @@ impl<A: Actor> Context<A> {
     }
 
     pub fn addr(&self) -> Addr<A> {
-        Addr {
-            tx: self.tx.clone(),
+        let mut tx_dead = false;
+        if let Some(ref tx) = self.tx {
+            // Tell Context that we are cloning a tx, tx_count should be increased.
+            if let Err(_) = tx.send(ContextMsg::CloneTx) {
+                tx_dead = true;
+            }
+        }
+
+        if tx_dead {
+            // No need to clone tx
+            Addr { tx: None }
+        } else {
+            Addr {
+                tx: self.tx.clone(),
+            }
         }
     }
 
@@ -95,9 +109,9 @@ impl<A: Actor> Context<A> {
 }
 
 /// Message type
-pub trait Message: Send + 'static {
-    type Resp: Send + 'static;
-}
+pub trait Message: Send + 'static {}
+
+impl<T> Message for T where T: Send + 'static {}
 
 /// Actor that could handle message type M should impl Handler<M>
 pub trait Handler<M>
@@ -105,7 +119,8 @@ where
     Self: Actor,
     M: Message,
 {
-    fn handle(&mut self, ctx: &mut Context<Self>, m: M) -> M::Resp;
+    type Result: Send + 'static;
+    fn handle(&mut self, ctx: &mut Context<Self>, m: M) -> Self::Result;
 }
 
 pub enum SendError<M> {
@@ -125,14 +140,14 @@ where
     A: Actor,
 {
     /// Send message to actor and ignore any result
-    pub fn do_send<M>(&self, m: M)
+    pub fn do_send<M>(&self, msg: M)
     where
         M: Message,
         A: Handler<M>,
     {
         if let Some(ref tx) = self.tx {
             let msg = Box::new(Envelope {
-                msg: Some(m),
+                msg: Some(msg),
                 tx_back: None,
             });
             let _ = tx.send(ContextMsg::Msg(msg));
@@ -140,15 +155,15 @@ where
     }
 
     /// Send Message to Actor and wait for resp
-    pub async fn send<M>(&self, m: M) -> Result<M::Resp, SendError<M>>
+    pub async fn send<M>(&self, msg: M) -> Result<A::Result, SendError<M>>
     where
         M: Message,
         A: Handler<M>,
     {
         if let Some(ref tx) = self.tx {
-            let (oneshot_tx, oneshot_rx) = oneshot::channel::<M::Resp>();
+            let (oneshot_tx, oneshot_rx) = oneshot::channel::<A::Result>();
             let msg = Box::new(Envelope {
-                msg: Some(m),
+                msg: Some(msg),
                 tx_back: Some(oneshot_tx),
             });
             if let Err(e) = tx.send(ContextMsg::Msg(msg)) {
@@ -158,7 +173,7 @@ where
                 Ok(oneshot_rx.await.unwrap())
             }
         } else {
-            Err(SendError::Closed(m))
+            Err(SendError::Closed(msg))
         }
     }
 }
@@ -205,16 +220,17 @@ where
     fn handle(&mut self, ctx: &mut Context<A>, act: &mut A);
 }
 
-struct Envelope<M>
+struct Envelope<A, M>
 where
+    A: Actor + Handler<M>,
     M: Message,
 {
     msg: Option<M>,
     // Send the result back to receiver
-    tx_back: Option<oneshot::Sender<M::Resp>>,
+    tx_back: Option<oneshot::Sender<A::Result>>,
 }
 
-impl<A, M> EnvelopeProxy<A> for Envelope<M>
+impl<A, M> EnvelopeProxy<A> for Envelope<A, M>
 where
     A: Actor + Handler<M>,
     M: Message,

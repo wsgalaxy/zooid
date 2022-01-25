@@ -1,32 +1,25 @@
-use zooid::{Actor, Context, Handler};
+use zooid::{Actor, Context, ContextBuilder};
 
-struct Ping {}
+struct MyActor;
+impl Actor for MyActor {
+    type Msg = ();
+    type Rsp = ();
 
-impl Actor for Ping {}
-
-impl Handler<i32> for Ping {
-    type Result = i32;
-
-    fn handle(&mut self, _ctx: &mut Context<Self>, m: i32) -> Self::Result {
-        println!("Ping got {}", m);
-        m + 1
+    fn handle_msg(&mut self, _ctx: &mut Context<Self>, _msg: Self::Msg) -> Option<Self::Rsp> {
+        println!("handle msg");
+        None
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let act = Ping {};
-    let ctx = Context::<Ping>::new();
-    let addr = ctx.addr();
-    ctx.start(act);
-
-    let mut i = 0;
+    let ctx_builder = ContextBuilder::<MyActor>::new(1024);
+    let act = MyActor;
+    let addr = ctx_builder.start(act);
     loop {
-        if let Ok(r) = addr.send(i).await {
-            println!("Receive {}", r);
-            i += 1;
-        } else {
-            panic!("Actor dead!");
+        if let Err(_) = addr.send(()).await {
+            println!("actor dead!");
+            break;
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }

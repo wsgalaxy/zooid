@@ -1,180 +1,45 @@
-use std::any::Any;
+use std::marker::PhantomData;
 use tokio::sync::{mpsc, oneshot};
 
-/// An Actor that run by Context<A>
-pub trait Actor: Sized + Send + 'static {}
-
-enum ContextMsg<A>
-where
-    A: Actor,
-{
-    CloneTx,
-    DropTx,
-    Msg(Box<dyn EnvelopeProxy<A>>),
+pub struct SendError<T>(T);
+pub enum TrySendError<T> {
+    Full(T),
+    Closed(T),
 }
 
-impl<A> ContextMsg<A>
-where
-    A: Actor,
-{
-    fn into_msg<M>(self) -> Option<M>
-    where
-        A: Handler<M>,
-        M: Message,
-    {
-        if let ContextMsg::Msg(mut m) = self {
-            if let Some(env) = m.as_any_mut().downcast_mut::<Envelope<A, M>>() {
-                env.msg.take()
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-}
-
-/// Execution context for actor
-pub struct Context<A>
-where
-    A: Actor,
-{
-    tx: Option<mpsc::UnboundedSender<ContextMsg<A>>>,
-    tx_count: u64,
-    rx: Option<mpsc::UnboundedReceiver<ContextMsg<A>>>,
-}
-
-impl<A: Actor> Context<A> {
-    pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Context {
-            tx: Some(tx),
-            tx_count: 0,
-            rx: Some(rx),
-        }
-    }
-
-    pub fn start(self, act: A) -> Addr<A> {
-        let addr = self.addr();
-        tokio::spawn(self.spawn(act));
-        addr
-    }
-
-    pub fn addr(&self) -> Addr<A> {
-        let mut tx_dead = false;
-        if let Some(ref tx) = self.tx {
-            // Tell Context that we are cloning a tx, tx_count should be increased.
-            if let Err(_) = tx.send(ContextMsg::CloneTx) {
-                tx_dead = true;
-            }
-        }
-
-        if tx_dead {
-            // No need to clone tx
-            Addr { tx: None }
-        } else {
-            Addr {
-                tx: self.tx.clone(),
-            }
-        }
-    }
-
-    async fn spawn(mut self, mut act: A) {
-        if let None = self.rx {
-            return;
-        }
-
-        let mut rx = self.rx.take().unwrap();
-
-        loop {
-            if let Some(msg) = rx.recv().await {
-                match msg {
-                    ContextMsg::CloneTx => self.tx_count += 1,
-                    ContextMsg::DropTx => {
-                        self.tx_count -= 1;
-                        if self.tx_count == 0 {
-                            // All tx dropped
-                            return;
-                        }
-                    }
-                    ContextMsg::Msg(mut msg) => {
-                        msg.handle(&mut self, &mut act);
-                    }
-                }
-            } else {
-                return;
-            }
-        }
-    }
-}
-
-/// Message type
-pub trait Message: Send + 'static {}
-
-impl<T> Message for T where T: Send + 'static {}
-
-/// Actor that could handle message type M should impl Handler<M>
-pub trait Handler<M>
-where
-    Self: Actor,
-    M: Message,
-{
-    type Result: Send + 'static;
-    fn handle(&mut self, ctx: &mut Context<Self>, m: M) -> Self::Result;
-}
-
-pub enum SendError<M> {
-    Closed(M),
-}
-
-/// Address for Actor
 pub struct Addr<A>
 where
     A: Actor,
 {
-    tx: Option<mpsc::UnboundedSender<ContextMsg<A>>>,
+    tx: mpsc::Sender<Envelope<<A as Actor>::Msg, <A as Actor>::Rsp>>,
 }
 
 impl<A> Addr<A>
 where
     A: Actor,
 {
-    /// Send message to actor and ignore any result
-    pub fn do_send<M>(&self, msg: M)
-    where
-        M: Message,
-        A: Handler<M>,
-    {
-        if let Some(ref tx) = self.tx {
-            let msg = Box::new(Envelope {
-                msg: Some(msg),
-                tx_back: None,
-            });
-            let _ = tx.send(ContextMsg::Msg(msg));
+    pub async fn send(&self, msg: A::Msg) -> Result<Option<A::Rsp>, SendError<A::Msg>> {
+        let (tx, rx) = oneshot::channel();
+        // Send to actor
+        if let Err(mpsc::error::SendError(evlp)) = self
+            .tx
+            .send(Envelope {
+                msg,
+                rsp_tx: Some(tx),
+            })
+            .await
+        {
+            return Err(SendError(evlp.msg));
+        }
+        // Now wait for response
+        match rx.await {
+            Ok(rsp) => Ok(Some(rsp)),
+            Err(_) => Ok(None),
         }
     }
-
-    /// Send Message to Actor and wait for resp
-    pub async fn send<M>(&self, msg: M) -> Result<A::Result, SendError<M>>
-    where
-        M: Message,
-        A: Handler<M>,
-    {
-        if let Some(ref tx) = self.tx {
-            let (oneshot_tx, oneshot_rx) = oneshot::channel::<A::Result>();
-            let msg = Box::new(Envelope {
-                msg: Some(msg),
-                tx_back: Some(oneshot_tx),
-            });
-            if let Err(e) = tx.send(ContextMsg::Msg(msg)) {
-                Err(SendError::Closed(e.0.into_msg().unwrap()))
-            } else {
-                // If no one send us a result, that would be a bug.
-                Ok(oneshot_rx.await.unwrap())
-            }
-        } else {
-            Err(SendError::Closed(msg))
-        }
+    pub fn try_send() -> Result<(), TrySendError<A::Rsp>> {
+        // TODO
+        Ok(())
     }
 }
 
@@ -183,81 +48,119 @@ where
     A: Actor,
 {
     fn clone(&self) -> Self {
-        let mut tx_dead = false;
-        if let Some(ref tx) = self.tx {
-            // Tell Context that we are cloning a tx, tx_count should be increased.
-            if let Err(_) = tx.send(ContextMsg::CloneTx) {
-                tx_dead = true;
-            }
-        }
-
-        if tx_dead {
-            // No need to clone tx
-            Addr { tx: None }
-        } else {
-            Addr {
-                tx: self.tx.clone(),
-            }
+        Addr {
+            tx: self.tx.clone(),
         }
     }
 }
 
-impl<A> Drop for Addr<A>
+pub trait Message: Send + Sized + 'static {}
+pub trait Response: Send + Sized + 'static {}
+
+impl<T> Message for T where T: Send + Sized + 'static {}
+impl<T> Response for T where T: Send + Sized + 'static {}
+
+struct Envelope<M, R>
+where
+    M: Message,
+    R: Response,
+{
+    msg: M,
+    rsp_tx: Option<oneshot::Sender<R>>,
+}
+
+pub struct Context<A>
 where
     A: Actor,
 {
-    fn drop(&mut self) {
-        if let Some(ref tx) = self.tx {
-            let _ = tx.send(ContextMsg::DropTx);
-        }
-    }
+    _p1: PhantomData<A>,
 }
 
-trait EnvelopeProxy<A>: Send
+impl<A> Context<A>
 where
     A: Actor,
 {
-    fn handle(&mut self, ctx: &mut Context<A>, act: &mut A);
+    fn new() -> Self {
+        Context {
+            _p1: Default::default(),
+        }
+    }
+
+    async fn run(
+        mut self,
+        mut act: A,
+        addr: Addr<A>,
+        mut rx: mpsc::Receiver<Envelope<A::Msg, A::Rsp>>,
+    ) {
+        act.start(&mut self, addr);
+        loop {
+            match rx.recv().await {
+                Some(evlp) => {
+                    act.handle_msg_async(&mut self, evlp.msg, evlp.rsp_tx);
+                }
+                None => break,
+            }
+        }
+        act.stop(&mut self);
+    }
 }
 
-struct Envelope<A, M>
+pub struct ContextBuilder<A>
 where
-    A: Actor + Handler<M>,
-    M: Message,
+    A: Actor,
 {
-    msg: Option<M>,
-    // Send the result back to receiver
-    tx_back: Option<oneshot::Sender<A::Result>>,
+    rx: mpsc::Receiver<Envelope<<A as Actor>::Msg, <A as Actor>::Rsp>>,
+    tx: mpsc::Sender<Envelope<<A as Actor>::Msg, <A as Actor>::Rsp>>,
 }
 
-impl<A, M> EnvelopeProxy<A> for Envelope<A, M>
+impl<A> ContextBuilder<A>
 where
-    A: Actor + Handler<M>,
-    M: Message,
+    A: Actor,
 {
-    fn handle(&mut self, ctx: &mut Context<A>, act: &mut A) {
-        let resp = act.handle(ctx, self.msg.take().unwrap());
-        if let Some(_) = self.tx_back {
-            let tx_back = self.tx_back.take().unwrap();
-            let _ = tx_back.send(resp);
+    pub fn new(cap: usize) -> Self {
+        let (tx, rx) = mpsc::channel(cap);
+        Self { rx, tx }
+    }
+
+    pub fn start(self, act: A) -> Addr<A> {
+        let addr = Addr { tx: self.tx };
+        let _addr = addr.clone();
+        let ctx = Context::new();
+        tokio::spawn(ctx.run(act, _addr, self.rx));
+        addr
+    }
+
+    pub fn addr(&self) -> Addr<A> {
+        Addr {
+            tx: self.tx.clone(),
         }
     }
 }
 
-trait AsAny {
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-}
+pub trait Actor: Send + Sized + 'static {
+    type Msg: Message;
+    type Rsp: Response;
 
-impl<T> AsAny for T
-where
-    T: Any,
-{
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn start(&mut self, _ctx: &mut Context<Self>, _addr: Addr<Self>) {}
+    fn stop(&mut self, _ctx: &mut Context<Self>) {}
+
+    fn handle_msg(&mut self, _ctx: &mut Context<Self>, _msg: Self::Msg) -> Option<Self::Rsp> {
+        None
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+    /// Rewrite this function to do async msg handling
+    fn handle_msg_async(
+        &mut self,
+        _ctx: &mut Context<Self>,
+        _msg: Self::Msg,
+        rsp_tx: Option<oneshot::Sender<Self::Rsp>>,
+    ) {
+        let rsp = self.handle_msg(_ctx, _msg);
+        if let None = rsp {
+            return;
+        }
+        if let Some(tx) = rsp_tx {
+            let _ = tx.send(rsp.unwrap());
+        }
     }
 }

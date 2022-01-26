@@ -18,3 +18,5 @@ name = "benchmark"
 
 [dependencies]
 tokio = { version = "1.15.0", features = ["full"] }
+rand = "0.8.4"
+num_cpus = "1.13.1"
